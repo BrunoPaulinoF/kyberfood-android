@@ -1,0 +1,135 @@
+name: Build App Android (KyberFood Impressora)
+
+# Gera o instalador (APK) ASSINADO do app Android e publica na Release fixa `android-latest`,
+# com nome de arquivo fixo — o link de download do KyberFood serve sempre a versão mais nova.
+#
+# Este arquivo vive no monorepo em `kyberfood-android/.github/` e chega aqui pelo espelhamento
+# (`npm run android:sync`). O build roda NESTE repositório público porque o Actions do
+# monorepo (privado) não está disponível.
+#
+# A cada push na main sobe SOZINHO para a próxima versão: lê o `version_code` publicado e soma 1.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Conferir os segredos do build
+        # Sem a chave de assinatura o build sairia com a chave de TESTE do Android, e esse
+        # instalador não atualiza por cima do app que já está nos celulares. Melhor não publicar.
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KYBERFOOD_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KYBERFOOD_KEYSTORE_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.KYBERFOOD_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.KYBERFOOD_SUPABASE_ANON_KEY }}
+        run: |
+          set -e
+          faltando=""
+          [ -n "$KEYSTORE_BASE64" ] || faltando="$faltando KYBERFOOD_KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || faltando="$faltando KYBERFOOD_KEYSTORE_PASSWORD"
+          [ -n "$SUPABASE_URL" ] || faltando="$faltando KYBERFOOD_SUPABASE_URL"
+          [ -n "$SUPABASE_ANON_KEY" ] || faltando="$faltando KYBERFOOD_SUPABASE_ANON_KEY"
+          if [ -n "$faltando" ]; then
+            echo "Faltam segredos em Settings > Secrets and variables > Actions:$faltando" >&2
+            exit 1
+          fi
+
+      - name: Resolver a versão
+        id: version
+        run: |
+          set -e
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/android-latest/latest.json" -o latest_check.json || true
+          ULTIMO=$(python3 -c "import json; print(int(json.load(open('latest_check.json')).get('version_code') or 0))" 2>/dev/null || echo 0)
+          rm -f latest_check.json
+          # A primeira publicação começa em 100: os instaladores de teste usaram números baixos,
+          # e a versão publicada tem que ser MAIOR que qualquer um deles para atualizar por cima.
+          if [ "$ULTIMO" -lt 99 ]; then ULTIMO=99; fi
+          CODIGO=$((ULTIMO + 1))
+          echo "code=$CODIGO" >> "$GITHUB_OUTPUT"
+          echo "name=1.0.$CODIGO" >> "$GITHUB_OUTPUT"
+          echo "Versão resolvida: 1.0.$CODIGO (código $CODIGO)"
+
+      - name: Instalar o Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar o Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Preparar a chave de assinatura
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KYBERFOOD_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/kyberfood-impressora.jks"
+
+      - name: Testes e build do instalador
+        env:
+          KYBERFOOD_SUPABASE_URL: ${{ secrets.KYBERFOOD_SUPABASE_URL }}
+          KYBERFOOD_SUPABASE_ANON_KEY: ${{ secrets.KYBERFOOD_SUPABASE_ANON_KEY }}
+          KYBERFOOD_KEYSTORE_FILE: ${{ runner.temp }}/kyberfood-impressora.jks
+          KYBERFOOD_KEYSTORE_PASSWORD: ${{ secrets.KYBERFOOD_KEYSTORE_PASSWORD }}
+          KYBERFOOD_KEY_ALIAS: kyberfood
+          KYBERFOOD_KEY_PASSWORD: ${{ secrets.KYBERFOOD_KEYSTORE_PASSWORD }}
+          KYBERFOOD_VERSION_CODE: ${{ steps.version.outputs.code }}
+          KYBERFOOD_VERSION_NAME: ${{ steps.version.outputs.name }}
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleRelease
+
+      - name: Conferir a assinatura e montar os arquivos
+        env:
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+        run: |
+          set -e
+          cp app/build/outputs/apk/release/app-release.apk KyberFood-Impressora.apk
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          CERT="$("$APKSIGNER" verify --print-certs KyberFood-Impressora.apk)"
+          echo "$CERT"
+          # Rede de segurança: instalador com a chave de teste do Android nunca é publicado.
+          if echo "$CERT" | grep -q "CN=Android Debug"; then
+            echo "O instalador saiu com a chave de TESTE. Publicação cancelada." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import hashlib, json, os, datetime
+          sha = hashlib.sha256(open('KyberFood-Impressora.apk', 'rb').read()).hexdigest()
+          manifest = {
+              'version': os.environ['VERSION_NAME'],
+              'version_code': int(os.environ['VERSION_CODE']),
+              'pub_date': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'notes': 'Atualização automática do KyberFood Impressora.',
+              'sha256': sha,
+          }
+          json.dump(manifest, open('latest.json', 'w'), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Publicar na Release android-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release view android-latest >/dev/null 2>&1 || gh release create android-latest \
+            --title "KyberFood Impressora (Android)" \
+            --notes "Instalador mais recente do app Android. É sobrescrito a cada build."
+          # O instalador sobe ANTES do latest.json: quem lê a versão nova já encontra o arquivo dela.
+          gh release upload android-latest KyberFood-Impressora.apk --clobber
+          gh release upload android-latest latest.json --clobber
